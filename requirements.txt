@@ -1,0 +1,9 @@
+customtkinter
+requests
+python-telegram-bot==21.6
+beautifulsoup4
+lxml
+pymupdf
+python-docx
+python-pptx
+markdownify
