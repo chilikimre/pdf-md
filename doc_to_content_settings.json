@@ -6,6 +6,7 @@
   "output_folder_name": "output",
   "copy_source": true,
   "client_name": "client_demo",
+  "ai_preclean": true,
   "api_url": "https://openrouter.ai/api/v1/chat/completions",
   "api_key": "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",
   "model_name": "openrouter/free"
