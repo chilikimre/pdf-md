@@ -2,33 +2,33 @@
 # -*- coding: utf-8 -*-
 
 """
-Doc-to-Content v8
+Doc-to-Content v10
 
-Что добавлено поверх v7:
-- нормальный UX для API:
-    * широкие поля
-    * статус API: не проверено / ок / ошибка
-    * кнопка "Проверить API"
-    * кнопка "Вставить OpenRouter"
-- верхняя кнопка "Конвертировать сейчас"
-- подсказки под AI полями
-- более понятный статус-бар
-- поля и действия не прячутся за высотой окна
+Что добавлено поверх v9:
+- CLI режим без UI
+- пакетная обработка через командную строку
+- zip-архив результата
+- единое ядро для desktop / bot / automation
+- удобно под Telegram-бота и серверную обёртку
+
+Примеры запуска:
+    py pdf_md_gui.py                  # GUI
+    py pdf_md_gui.py --cli --input fail1.pdf --client demo --preset single --result summary --mode AI
+    py pdf_md_gui.py --cli --input ./docs --client demo --preset creator --mode AI --zip
 
 Установка:
     py -m pip install customtkinter pymupdf python-docx python-pptx beautifulsoup4 markdownify requests
-
-Запуск:
-    py pdf_md_gui.py
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import queue
 import re
 import shutil
 import threading
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -57,47 +57,93 @@ TEXT = "#eef4ff"
 TEXT_DIM = "#93a4c3"
 ACCENT = "#4f8cff"
 ACCENT_HOVER = "#3d74d4"
-OK = "#22c55e"
-ERR = "#ef4444"
-WARN = "#f59e0b"
 
 SUPPORTED_INPUTS = {".pdf", ".docx", ".pptx", ".html", ".htm"}
 SETTINGS_PATH = Path("doc_to_content_settings.json")
 HISTORY_PATH = Path("doc_to_content_history.jsonl")
 
+FREE_MODELS = [
+    "openrouter/free",
+    "mistralai/mistral-7b-instruct:free",
+    "openchat/openchat-7b:free",
+    "nousresearch/nous-capybara-7b:free",
+]
+
 PROMPTS = {
     "text": """
 Очисти текст от мусора верстки, склей сломанные слова и переносы, сохрани смысл без фантазий.
+Исправь очевидные языковые ошибки, если они появились из-за парсинга.
 Верни только чистый читабельный текст.
 """.strip(),
     "markdown": """
 Преврати сырой текст в чистый структурированный Markdown.
-Восстанови заголовки, абзацы, списки, но не придумывай факты.
+Требования:
+- восстанови заголовки, абзацы и списки
+- убери артефакты парсинга и пустые повторы
+- не выдумывай факты
+- не добавляй вступлений и комментариев
 Верни только итоговый Markdown.
 """.strip(),
     "summary": """
-Сделай краткое понятное summary документа.
-Выдели главное, убери мусор и повторения.
-Структурируй результат.
-Верни только итоговый текст.
+Сделай краткое, но профессиональное summary текста.
+
+Требования:
+- Пиши как для клиента или бизнес-презентации
+- Без слов «Совет:», «Рекомендуется», «Старайтесь»
+- Убери общие фразы, банальности и пустые выводы
+- Исправь грамматику и формулировки
+- Используй единый деловой и уверенный тон
+
+Формат:
+- 1–2 абзаца
+- Допускается маркированный список, но без «Совет:»
+
+Важно:
+- Ничего не выдумывай
+- Работай только с исходным текстом
+- Верни только итоговый текст
 """.strip(),
     "article": """
 Преврати текст в полноценную читабельную статью.
-Добавь логичную структуру: заголовки, подзаголовки, абзацы.
-Ничего не выдумывай, работай только с исходным материалом.
-Верни только итоговую статью.
+
+Требования:
+- Сделай сильный заголовок
+- Добавь понятную структуру: заголовки, подзаголовки, абзацы
+- Убери мусор парсинга, повторы и канцелярит
+- Не добавляй факты, которых нет в исходнике
+- Тон: живой, уверенный, профессиональный
+
+Формат:
+- Готовая статья в Markdown
+- Без пояснений от себя
 """.strip(),
     "posts": """
-Сделай из текста 5-10 коротких постов для Telegram.
-Каждый пост должен быть отдельным, понятным и пригодным для публикации.
-Без воды и без служебных пояснений.
-Верни только готовые посты.
+Сделай из текста 5–10 коротких постов для Telegram.
+
+Требования:
+- Каждый пост должен быть отдельным и законченным
+- Нормальный человеческий русский, без воды
+- Без слов «Совет:» и банальных наставлений
+- Можно делать разные углы подачи: инсайт, кейс, мысль, позиция
+- Не выдумывай факты
+
+Формат:
+- Каждый пост отделяй строкой: ---
+- Верни только готовые посты
 """.strip(),
     "faq": """
 Сделай FAQ в формате вопрос-ответ.
-Сгруппируй материал логично, формулируй вопросы коротко и понятно.
-Ничего не выдумывай.
-Верни только итоговый FAQ.
+
+Требования:
+- Сгруппируй материал логично
+- Формулируй вопросы коротко и понятно
+- Ответы — по делу, без воды
+- Не выдумывай факты
+
+Формат:
+- Markdown
+- Вопрос как подзаголовок, ниже ответ
+- Верни только итоговый FAQ
 """.strip(),
 }
 
@@ -207,6 +253,17 @@ def light_cleanup(text: str) -> str:
     return cleaned.strip() + "\n"
 
 
+def _build_headers(api_key: str) -> dict[str, str]:
+    headers = {
+        "Content-Type": "application/json",
+        "HTTP-Referer": "http://localhost",
+        "X-Title": "doc-to-content",
+    }
+    if api_key.strip():
+        headers["Authorization"] = f"Bearer {api_key.strip()}"
+    return headers
+
+
 def ai_cleanup(raw_text: str, *, api_url: str, api_key: str, model: str, output_format: str, extra_prompt: str, timeout: int = 180) -> str:
     format_hint = "Markdown" if output_format == ".md" else "plain text"
     prompt = f"""
@@ -227,10 +284,6 @@ def ai_cleanup(raw_text: str, *, api_url: str, api_key: str, model: str, output_
 {raw_text}
 """.strip()
 
-    headers = {"Content-Type": "application/json"}
-    if api_key.strip():
-        headers["Authorization"] = f"Bearer {api_key.strip()}"
-
     payload = {
         "model": model.strip(),
         "messages": [
@@ -240,7 +293,7 @@ def ai_cleanup(raw_text: str, *, api_url: str, api_key: str, model: str, output_
         "temperature": 0.1,
     }
 
-    response = requests.post(api_url.strip(), headers=headers, json=payload, timeout=timeout)
+    response = requests.post(api_url.strip(), headers=_build_headers(api_key), json=payload, timeout=timeout)
     response.raise_for_status()
     data = response.json()
 
@@ -248,6 +301,51 @@ def ai_cleanup(raw_text: str, *, api_url: str, api_key: str, model: str, output_
         return data["choices"][0]["message"]["content"].strip() + "\n"
     except Exception as exc:
         raise RuntimeError(f"Не удалось разобрать ответ API: {exc}\nОтвет: {json.dumps(data, ensure_ascii=False)[:800]}")
+
+
+def ai_cleanup_with_fallback(raw_text: str, *, api_url: str, api_key: str, model: str, output_format: str, extra_prompt: str, timeout: int = 180, log_fn=None) -> str:
+    models_to_try = [model.strip()] if model.strip() else []
+    for fallback in FREE_MODELS:
+        if fallback not in models_to_try:
+            models_to_try.append(fallback)
+
+    last_exc = None
+    for candidate in models_to_try:
+        try:
+            if log_fn:
+                log_fn(f"Пробую модель: {candidate}")
+            return ai_cleanup(
+                raw_text,
+                api_url=api_url,
+                api_key=api_key,
+                model=candidate,
+                output_format=output_format,
+                extra_prompt=extra_prompt,
+                timeout=timeout,
+            )
+        except Exception as exc:
+            last_exc = exc
+            if log_fn:
+                log_fn(f"Модель не взлетела: {candidate} -> {exc}")
+            continue
+
+    raise RuntimeError(f"Не удалось получить ответ ни от одной модели. Последняя ошибка: {last_exc}")
+
+
+def zip_directory(src_dir: Path, zip_path: Path) -> Path:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for path in src_dir.rglob("*"):
+            if path.is_file():
+                zf.write(path, path.relative_to(src_dir))
+    return zip_path
+
+
+def collect_input_paths(input_path: Path) -> list[Path]:
+    if input_path.is_file():
+        return [input_path] if input_path.suffix.lower() in SUPPORTED_INPUTS else []
+    if input_path.is_dir():
+        return sorted([p for p in input_path.rglob("*") if p.suffix.lower() in SUPPORTED_INPUTS], key=lambda p: p.name.lower())
+    return []
 
 
 # -------------------- EXTRACTORS --------------------
@@ -324,12 +422,91 @@ def extract_raw_text(path: Path, output_format: str) -> str:
     raise ValueError(f"Формат не поддерживается: {ext}")
 
 
-# -------------------- UI --------------------
+# -------------------- CORE SERVICE --------------------
+
+class CoreService:
+    def __init__(self, *, process_mode: str, client_name: str, output_folder_name: str, use_output_folder: bool, copy_source: bool, api_url: str, api_key: str, model_name: str, ai_preclean: bool, logger=None):
+        self.process_mode = process_mode
+        self.client_name = client_name
+        self.output_folder_name = output_folder_name
+        self.use_output_folder = use_output_folder
+        self.copy_source = copy_source
+        self.api_url = api_url
+        self.api_key = api_key
+        self.model_name = model_name
+        self.ai_preclean = ai_preclean
+        self.logger = logger or (lambda msg: None)
+
+    def _make_client_dir(self, src: Path) -> Path:
+        if self.use_output_folder:
+            root = src.parent / self.output_folder_name.strip()
+            root.mkdir(parents=True, exist_ok=True)
+        else:
+            root = src.parent
+        client_dir = root / f"{slugify(self.client_name)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        client_dir.mkdir(parents=True, exist_ok=True)
+        return client_dir
+
+    def _process_single_result(self, raw: str, result_type: str, ext: str) -> str:
+        if self.process_mode == "RAW":
+            return raw
+        if self.process_mode == "CLEAN":
+            return light_cleanup(raw)
+        if self.process_mode == "AI":
+            prepared = light_cleanup(raw) if self.ai_preclean else raw
+            prompt = PROMPTS[result_type]
+            return ai_cleanup_with_fallback(
+                prepared,
+                api_url=self.api_url,
+                api_key=self.api_key,
+                model=self.model_name,
+                output_format=ext,
+                extra_prompt=prompt,
+                log_fn=self.logger,
+            )
+        raise ValueError(f"Неизвестный режим: {self.process_mode}")
+
+    def process_file(self, src: Path, jobs: list[tuple[str, str]]) -> Path:
+        self.logger(f"Старт: {src.name}")
+        client_dir = self._make_client_dir(src)
+        outputs_dir = client_dir / "outputs"
+        outputs_dir.mkdir(parents=True, exist_ok=True)
+
+        if self.copy_source:
+            shutil.copy2(src, client_dir / src.name)
+
+        manifest = {
+            "timestamp": now_iso(),
+            "client_name": self.client_name,
+            "source": str(src),
+            "process_mode": self.process_mode,
+            "jobs": [],
+        }
+
+        for result_type, out_ext in jobs:
+            raw = extract_raw_text(src, out_ext)
+            final = self._process_single_result(raw, result_type, out_ext)
+            target = outputs_dir / f"{src.stem}_{result_type}{out_ext}"
+            target.write_text(final, encoding="utf-8")
+            manifest["jobs"].append({
+                "result_type": result_type,
+                "path": str(target),
+                "ext": out_ext,
+            })
+            self.logger(f"  -> {target.name}")
+
+        write_json(client_dir / "manifest.json", manifest)
+        append_jsonl(HISTORY_PATH, manifest)
+        self.logger(f"Готово: {client_dir}")
+        return client_dir
+
+
+# -------------------- GUI --------------------
 
 class App(ctk.CTk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Doc-to-Content v8")
+        self.title("Doc-to-Content v10")
         self.geometry("1360x920")
         self.minsize(1200, 800)
         self.configure(fg_color=APP_BG)
@@ -346,16 +523,16 @@ class App(ctk.CTk):
         self.output_folder_name = ctk.StringVar(value=settings.get("output_folder_name", "output"))
         self.copy_source = ctk.BooleanVar(value=settings.get("copy_source", True))
         self.client_name = ctk.StringVar(value=settings.get("client_name", "client_demo"))
+        self.ai_preclean = ctk.BooleanVar(value=settings.get("ai_preclean", True))
 
-        self.api_url = ctk.StringVar(value=settings.get("api_url", "http://localhost:1234/v1/chat/completions"))
+        self.api_url = ctk.StringVar(value=settings.get("api_url", "https://openrouter.ai/api/v1/chat/completions"))
         self.api_key = ctk.StringVar(value=settings.get("api_key", ""))
-        self.model_name = ctk.StringVar(value=settings.get("model_name", "gpt-4.1-mini"))
+        self.model_name = ctk.StringVar(value=settings.get("model_name", "openrouter/free"))
         self.api_status_text = ctk.StringVar(value="● API не проверено")
 
         self._build_ui()
         self.after(120, self._drain_queue)
 
-    # ---------- ui ----------
     def _build_ui(self) -> None:
         self.grid_columnconfigure(0, weight=0)
         self.grid_columnconfigure(1, weight=1)
@@ -363,7 +540,6 @@ class App(ctk.CTk):
 
         self.sidebar = ctk.CTkScrollableFrame(self, width=370, fg_color=CARD_ALT, corner_radius=0, border_width=1, border_color=BORDER)
         self.sidebar.grid(row=0, column=0, sticky="nsew")
-        
 
         self.main = ctk.CTkFrame(self, fg_color=APP_BG, corner_radius=0)
         self.main.grid(row=0, column=1, sticky="nsew")
@@ -380,9 +556,8 @@ class App(ctk.CTk):
         top = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         top.pack(fill="x", padx=20, pady=(20, 10))
         ctk.CTkLabel(top, text="Doc-to-Content", font=ctk.CTkFont(size=28, weight="bold"), text_color=TEXT).pack(anchor="w")
-        ctk.CTkLabel(top, text="Версия с нормальным UX: API видно, статус видно, кнопки не прячутся, действия понятны.", text_color=TEXT_DIM, wraplength=300, justify="left").pack(anchor="w", pady=(8, 0))
+        ctk.CTkLabel(top, text="GUI + CLI. Ядро уже можно оборачивать в бота, вебку или автоматику.", text_color=TEXT_DIM, wraplength=300, justify="left").pack(anchor="w", pady=(8, 0))
 
-        # Главная кнопка наверху и всегда видна
         ctk.CTkButton(self.sidebar, text="Конвертировать сейчас", command=self.start_conversion, height=48, corner_radius=14, fg_color=ACCENT, hover_color=ACCENT_HOVER, font=ctk.CTkFont(size=15, weight="bold")).pack(fill="x", padx=16, pady=(8, 16))
 
         self._section_label(self.sidebar, "ПАКЕТ РЕЗУЛЬТАТА")
@@ -405,6 +580,7 @@ class App(ctk.CTk):
         mode_card.pack(fill="x", padx=16, pady=(0, 12))
         for text, value in [("RAW — как есть", "RAW"), ("CLEAN — локальная чистка", "CLEAN"), ("AI — через модель", "AI")]:
             ctk.CTkRadioButton(mode_card, text=text, value=value, variable=self.process_mode, text_color=TEXT).pack(anchor="w", padx=14, pady=8)
+        ctk.CTkCheckBox(mode_card, text="Перед AI сначала прогонять CLEAN", variable=self.ai_preclean, text_color=TEXT).pack(anchor="w", padx=14, pady=(6, 12))
 
         self._section_label(self.sidebar, "УПАКОВКА")
         package_card = self._card(self.sidebar)
@@ -417,20 +593,13 @@ class App(ctk.CTk):
         self._section_label(self.sidebar, "AI НАСТРОЙКИ")
         ai_card = self._card(self.sidebar)
         ai_card.pack(fill="x", padx=16, pady=(0, 12))
-
         self._entry(ai_card, "API URL", self.api_url)
-        ctk.CTkLabel(ai_card, text="Сюда вставляется только адрес, например: https://openrouter.ai/api/v1/chat/completions", text_color=TEXT_DIM, wraplength=300, justify="left").pack(anchor="w", padx=14, pady=(2, 8))
-
         self._entry(ai_card, "API Key", self.api_key, show="*")
-        ctk.CTkLabel(ai_card, text="Если провайдер требует ключ — вставляешь его сюда. Если нет — оставляешь пусто.", text_color=TEXT_DIM, wraplength=300, justify="left").pack(anchor="w", padx=14, pady=(2, 8))
-
         self._entry(ai_card, "Model", self.model_name)
-        ctk.CTkLabel(ai_card, text="Пример: openai/gpt-4o-mini или имя локальной модели твоего сервера.", text_color=TEXT_DIM, wraplength=300, justify="left").pack(anchor="w", padx=14, pady=(2, 10))
-
         ctk.CTkLabel(ai_card, textvariable=self.api_status_text, text_color=TEXT_DIM, font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=14, pady=(4, 10))
 
         api_btns = ctk.CTkFrame(ai_card, fg_color="transparent")
-        api_btns.pack(fill="x", padx=14, pady=(0, 14))
+        api_btns.pack(fill="x", padx=14, pady=(0, 8))
         ctk.CTkButton(api_btns, text="Проверить API", command=self.check_api, height=38, corner_radius=12, fg_color="#1b2943", hover_color="#243657", border_width=1, border_color=BORDER).pack(side="left", fill="x", expand=True, padx=(0, 6))
         ctk.CTkButton(api_btns, text="Вставить OpenRouter", command=self.fill_openrouter_defaults, height=38, corner_radius=12, fg_color="#1b2943", hover_color="#243657", border_width=1, border_color=BORDER).pack(side="left", fill="x", expand=True, padx=(6, 0))
 
@@ -446,11 +615,10 @@ class App(ctk.CTk):
         header = ctk.CTkFrame(self.main, fg_color="transparent")
         header.grid(row=0, column=0, sticky="ew", padx=26, pady=(22, 10))
         header.grid_columnconfigure(0, weight=1)
-
         left = ctk.CTkFrame(header, fg_color="transparent")
         left.grid(row=0, column=0, sticky="w")
         ctk.CTkLabel(left, text="Файлы", font=ctk.CTkFont(size=30, weight="bold"), text_color=TEXT).pack(anchor="w")
-        ctk.CTkLabel(left, text="Пакеты под реальные офферы: summary, article, posts, FAQ, knowledge pack.", text_color=TEXT_DIM).pack(anchor="w", pady=(6, 0))
+        ctk.CTkLabel(left, text="Теперь ядро можно запускать и без окна — через CLI.", text_color=TEXT_DIM).pack(anchor="w", pady=(6, 0))
 
         actions = ctk.CTkFrame(header, fg_color="transparent")
         actions.grid(row=0, column=1, sticky="e")
@@ -504,7 +672,6 @@ class App(ctk.CTk):
         self.log_box = ctk.CTkTextbox(log_card, fg_color=APP_BG, border_width=0, text_color=TEXT_DIM, font=("Consolas", 12))
         self.log_box.pack(fill="both", expand=True, padx=18, pady=(0, 18))
 
-    # ---------- ui helpers ----------
     def _section_label(self, parent, text: str) -> None:
         ctk.CTkLabel(parent, text=text, text_color=TEXT_DIM, font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=18, pady=(2, 8))
 
@@ -531,14 +698,9 @@ class App(ctk.CTk):
     def set_progress(self, value: float) -> None:
         self.progress.set(max(0.0, min(1.0, value)))
 
-    def set_api_status(self, text: str, color: str = TEXT_DIM) -> None:
-        self.api_status_text.set(text)
-        # Перекрасить label напрямую нельзя по StringVar, поэтому найдём и обновим ниже при желании.
-
-    # ---------- API UX ----------
     def fill_openrouter_defaults(self) -> None:
         self.api_url.set("https://openrouter.ai/api/v1/chat/completions")
-        self.model_name.set("openai/gpt-4o-mini")
+        self.model_name.set("openrouter/free")
         self.api_status_text.set("● Подставлены дефолты OpenRouter")
         self.log("Подставлены значения OpenRouter по умолчанию.")
 
@@ -548,35 +710,33 @@ class App(ctk.CTk):
 
     def _check_api_worker(self) -> None:
         self.queue.put(("api_status", "● Проверяю API..."))
-        try:
-            headers = {
-    "Content-Type": "application/json",
-    "HTTP-Referer": "http://localhost",
-    "X-Title": "doc-to-content"
-}
-            
-            if self.api_key.get().strip():
-                headers["Authorization"] = f"Bearer {self.api_key.get().strip()}"
+        models_to_try = [self.model_name.get().strip()] if self.model_name.get().strip() else []
+        for fallback in FREE_MODELS:
+            if fallback not in models_to_try:
+                models_to_try.append(fallback)
+        for candidate in models_to_try:
+            try:
+                response = requests.post(
+                    self.api_url.get().strip(),
+                    headers=_build_headers(self.api_key.get()),
+                    json={
+                        "model": candidate,
+                        "messages": [{"role": "user", "content": "ping"}],
+                        "max_tokens": 5,
+                        "temperature": 0,
+                    },
+                    timeout=20,
+                )
+                response.raise_for_status()
+                self.queue.put(("api_status", f"● API подключен ({candidate})"))
+                self.queue.put(("log", f"API OK: {candidate}"))
+                if candidate != self.model_name.get().strip():
+                    self.model_name.set(candidate)
+                return
+            except Exception as exc:
+                self.queue.put(("log", f"API ERROR on {candidate}: {exc}"))
+        self.queue.put(("api_status", "● Ошибка API"))
 
-            response = requests.post(
-                self.api_url.get().strip(),
-                headers=headers,
-                json={
-                    "model": self.model_name.get().strip(),
-                    "messages": [{"role": "user", "content": "ping"}],
-                    "max_tokens": 5,
-                    "temperature": 0,
-                },
-                timeout=20,
-            )
-            response.raise_for_status()
-            self.queue.put(("api_status", "● API подключен"))
-            self.queue.put(("log", "API OK"))
-        except Exception as exc:
-            self.queue.put(("api_status", f"● Ошибка API: {exc}"))
-            self.queue.put(("log", f"API ERROR: {exc}"))
-
-    # ---------- settings ----------
     def save_settings(self) -> None:
         data = {
             "process_mode": self.process_mode.get(),
@@ -586,6 +746,7 @@ class App(ctk.CTk):
             "output_folder_name": self.output_folder_name.get(),
             "copy_source": self.copy_source.get(),
             "client_name": self.client_name.get(),
+            "ai_preclean": self.ai_preclean.get(),
             "api_url": self.api_url.get(),
             "api_key": self.api_key.get(),
             "model_name": self.model_name.get(),
@@ -593,7 +754,6 @@ class App(ctk.CTk):
         write_json(SETTINGS_PATH, data)
         self.log(f"Настройки сохранены: {SETTINGS_PATH}")
 
-    # ---------- files ----------
     def add_files(self) -> None:
         paths = filedialog.askopenfilenames(title="Выбери файлы", filetypes=[("Supported", "*.pdf *.docx *.pptx *.html *.htm"), ("All files", "*.*")])
         self._append_paths([Path(p) for p in paths])
@@ -602,7 +762,7 @@ class App(ctk.CTk):
         folder = filedialog.askdirectory(title="Выбери папку")
         if not folder:
             return
-        paths = [p for p in Path(folder).rglob("*") if p.suffix.lower() in SUPPORTED_INPUTS]
+        paths = collect_input_paths(Path(folder))
         self._append_paths(paths)
 
     def _append_paths(self, paths: list[Path]) -> None:
@@ -663,7 +823,6 @@ class App(ctk.CTk):
         except Exception as exc:
             messagebox.showerror("Ошибка", f"Не удалось открыть папку: {exc}")
 
-    # ---------- processing ----------
     def start_conversion(self) -> None:
         if not self.files:
             self.log("Нет файлов для обработки.")
@@ -673,88 +832,35 @@ class App(ctk.CTk):
         thread = threading.Thread(target=self._worker, daemon=True)
         thread.start()
 
-    def _make_client_dir(self, src: Path) -> Path:
-        if self.use_output_folder.get():
-            root = src.parent / self.output_folder_name.get().strip()
-            root.mkdir(parents=True, exist_ok=True)
-        else:
-            root = src.parent
-        client_dir = root / f"{slugify(self.client_name.get())}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        client_dir.mkdir(parents=True, exist_ok=True)
-        return client_dir
-
-    def _process_single_result(self, raw: str, result_type: str, process_mode: str, ext: str) -> str:
-        if process_mode == "RAW":
-            return raw
-        if process_mode == "CLEAN":
-            return light_cleanup(raw)
-        if process_mode == "AI":
-            prompt = PROMPTS[result_type]
-            return ai_cleanup(
-                raw,
-                api_url=self.api_url.get(),
-                api_key=self.api_key.get(),
-                model=self.model_name.get(),
-                output_format=ext,
-                extra_prompt=prompt,
-            )
-        raise ValueError(f"Неизвестный режим: {process_mode}")
-
     def _worker(self) -> None:
         total = len(self.files)
-        process_mode = self.process_mode.get()
         preset = self.pack_preset.get()
-        if preset == "single":
-            jobs = [(self.single_result_type.get(), ".md" if self.single_result_type.get() != "text" else ".txt")]
-        else:
-            jobs = PACK_PRESETS[preset]
+        jobs = [(self.single_result_type.get(), ".md" if self.single_result_type.get() != "text" else ".txt")] if preset == "single" else PACK_PRESETS[preset]
+
+        service = CoreService(
+            process_mode=self.process_mode.get(),
+            client_name=self.client_name.get(),
+            output_folder_name=self.output_folder_name.get(),
+            use_output_folder=self.use_output_folder.get(),
+            copy_source=self.copy_source.get(),
+            api_url=self.api_url.get(),
+            api_key=self.api_key.get(),
+            model_name=self.model_name.get(),
+            ai_preclean=self.ai_preclean.get(),
+            logger=lambda msg: self.queue.put(("log", msg)),
+        )
 
         self.queue.put(("status", f"Погнали. Файлов: {total}"))
         self.queue.put(("progress", 0.0))
-
         for index, src in enumerate(self.files, start=1):
             try:
-                self.queue.put(("log", f"[{index}/{total}] {src.name} — старт"))
-                client_dir = self._make_client_dir(src)
-                outputs_dir = client_dir / "outputs"
-                outputs_dir.mkdir(parents=True, exist_ok=True)
-
-                if self.copy_source.get():
-                    shutil.copy2(src, client_dir / src.name)
-
-                manifest = {
-                    "timestamp": now_iso(),
-                    "client_name": self.client_name.get(),
-                    "source": str(src),
-                    "process_mode": process_mode,
-                    "preset": preset,
-                    "jobs": [],
-                }
-
-                for result_type, out_ext in jobs:
-                    raw = extract_raw_text(src, out_ext)
-                    final = self._process_single_result(raw, result_type, process_mode, out_ext)
-                    target = outputs_dir / f"{src.stem}_{result_type}{out_ext}"
-                    target.write_text(final, encoding="utf-8")
-                    manifest["jobs"].append({
-                        "result_type": result_type,
-                        "path": str(target),
-                        "ext": out_ext,
-                    })
-                    self.queue.put(("log", f"    -> {target.name}"))
-
-                write_json(client_dir / "manifest.json", manifest)
-                append_jsonl(HISTORY_PATH, manifest)
-
+                client_dir = service.process_file(src, jobs)
                 self.queue.put(("result", JobResult(src, client_dir, True, "ok")))
-                self.queue.put(("log", f"[{index}/{total}] Готово: {client_dir.name}"))
             except Exception as exc:
                 self.queue.put(("result", JobResult(src, None, False, str(exc))))
-                self.queue.put(("log", f"[{index}/{total}] Ошибка: {src.name} -> {exc}"))
-
+                self.queue.put(("log", f"Ошибка: {src.name} -> {exc}"))
             self.queue.put(("progress", index / total))
             self.queue.put(("status", f"Обработано {index}/{total}"))
-
         self.queue.put(("status", "Готово. Пакеты собраны."))
         self.queue.put(("log", f"История сохранена в {HISTORY_PATH}"))
         self.queue.put(("log", "Готово всё."))
@@ -783,10 +889,81 @@ class App(ctk.CTk):
             self.after(120, self._drain_queue)
 
 
-def main() -> None:
+# -------------------- CLI --------------------
+
+def build_jobs_from_args(preset: str, result: str) -> list[tuple[str, str]]:
+    if preset == "single":
+        return [(result, ".md" if result != "text" else ".txt")]
+    return PACK_PRESETS[preset]
+
+
+def run_cli(args: argparse.Namespace) -> int:
+    input_path = Path(args.input)
+    files = collect_input_paths(input_path)
+    if not files:
+        print(f"Не найдено поддерживаемых файлов: {input_path}")
+        return 1
+
+    jobs = build_jobs_from_args(args.preset, args.result)
+    service = CoreService(
+        process_mode=args.mode,
+        client_name=args.client,
+        output_folder_name=args.output_dir,
+        use_output_folder=not args.no_output_folder,
+        copy_source=not args.no_copy_source,
+        api_url=args.api_url,
+        api_key=args.api_key,
+        model_name=args.model,
+        ai_preclean=not args.no_preclean,
+        logger=lambda msg: print(msg),
+    )
+
+    created_dirs: list[Path] = []
+    for src in files:
+        created_dirs.append(service.process_file(src, jobs))
+
+    if args.zip:
+        for directory in created_dirs:
+            zip_path = directory.with_suffix(".zip")
+            zip_directory(directory, zip_path)
+            print(f"ZIP: {zip_path}")
+
+    print("Готово.")
+    return 0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Doc-to-Content v10")
+    parser.add_argument("--cli", action="store_true", help="Запустить без GUI")
+    parser.add_argument("--input", help="Файл или папка для обработки")
+    parser.add_argument("--client", default="client_demo", help="Имя клиента или проекта")
+    parser.add_argument("--preset", default="single", choices=["single", "creator", "knowledge"])
+    parser.add_argument("--result", default="summary", choices=["text", "markdown", "summary", "article", "posts", "faq"])
+    parser.add_argument("--mode", default="AI", choices=["RAW", "CLEAN", "AI"])
+    parser.add_argument("--api-url", default="https://openrouter.ai/api/v1/chat/completions")
+    parser.add_argument("--api-key", default="")
+    parser.add_argument("--model", default="openrouter/free")
+    parser.add_argument("--output-dir", default="output")
+    parser.add_argument("--no-output-folder", action="store_true")
+    parser.add_argument("--no-copy-source", action="store_true")
+    parser.add_argument("--no-preclean", action="store_true")
+    parser.add_argument("--zip", action="store_true")
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if args.cli:
+        if not args.input:
+            parser.error("Для --cli нужен --input")
+        return run_cli(args)
+
     app = App()
     app.mainloop()
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

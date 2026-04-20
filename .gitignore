@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+doc_to_content_history.jsonl
+doc_to_content_settings.json
+users_db.json
+
+output/
+
+.venv/
+venv/
+env/
+
+*.zip
+.vscode/
